@@ -1,10 +1,17 @@
 package com.project;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import java.io.IOException;
+
 import java.net.Socket;
 import java.net.ServerSocket;
 import java.io.*;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+
+import com.project.entity.dto.IncomingMessage;
+import com.project.entity.dto.OutgoingMessage;
 import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
@@ -33,6 +40,7 @@ public class TcpChatServer {
 @Slf4j
 class ClientHandler implements Runnable {
     private final Socket clientSocket;
+    private final ObjectMapper objectMapper = new ObjectMapper();
 
     public ClientHandler(Socket socket) {
         this.clientSocket = socket;
@@ -46,11 +54,26 @@ class ClientHandler implements Runnable {
         try (BufferedReader in = new BufferedReader(new InputStreamReader(clientSocket.getInputStream()));
              BufferedWriter out = new BufferedWriter(new OutputStreamWriter(clientSocket.getOutputStream()))) {
 
-            String message;
-            while ((message = in.readLine()) != null) {
-                log.info("[{}] Received: {}", clientInfo, message);
-                out.write("Got it!\n");
-                out.flush();
+            String jsonMessage;
+            while ((jsonMessage = in.readLine()) != null) {
+                log.info("[{}] Received JSON: {}", clientInfo, jsonMessage);
+
+                try {
+                    IncomingMessage incomingMessage = objectMapper.readValue(jsonMessage, IncomingMessage.class);
+                    log.info("[{}] Type: {}, Body: {}", clientInfo, incomingMessage.getType(), incomingMessage.getBody());
+
+                    OutgoingMessage outgoingMessage = new OutgoingMessage(200, "Success");
+                    String responseJson = objectMapper.writeValueAsString(outgoingMessage);
+                    out.write(responseJson + "\n");
+                    out.flush();
+
+                } catch (JsonProcessingException e) {
+                    log.error("[{}] Invalid JSON format: {}", clientInfo, e.getMessage());
+                    OutgoingMessage errorResponse = new OutgoingMessage(400, "Invalid JSON format");
+                    String errorJson = objectMapper.writeValueAsString(errorResponse);
+                    out.write(errorJson + "\n");
+                    out.flush();
+                }
             }
         } catch (IOException e) {
             log.error("[{}] Error in client handler: ", clientInfo, e);
