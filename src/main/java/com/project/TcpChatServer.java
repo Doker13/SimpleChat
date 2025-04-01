@@ -14,23 +14,25 @@ import java.util.concurrent.Executors;
 @Slf4j
 public class TcpChatServer {
     private static final int PORT = 8080;
-    private static final int THREAD_POOL_SIZE = 6;
     protected static final String WS_MAGIC_STRING = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
     public static void main(String[] args) {
-        ExecutorService threadPool = Executors.newFixedThreadPool(THREAD_POOL_SIZE);
+        try (ExecutorService threadPool = Executors.newVirtualThreadPerTaskExecutor()) {
 
-        try (ServerSocket serverSocket = new ServerSocket(PORT)) {
-            log.info("Server started on port {}", PORT);
+            try (ServerSocket serverSocket = new ServerSocket(PORT)) {
+                log.info("Server started on port {}", PORT);
 
-            while (true) {
-                Socket clientSocket = serverSocket.accept();
-                threadPool.execute(new WebSocketHandler(clientSocket));
+                while (true) {
+                    Socket clientSocket = serverSocket.accept();
+                    threadPool.execute(new WebSocketHandler(clientSocket));
+                }
+            } catch (IOException e) {
+                log.error("Server error: ", e);
+            } finally {
+                threadPool.shutdown();
             }
-        } catch (IOException e) {
-            log.error("Server error: ", e);
-        } finally {
-            threadPool.shutdown();
+        } catch (NullPointerException e) {
+            log.error("Can't create thread: ", e);
         }
     }
 }
@@ -47,7 +49,7 @@ class WebSocketHandler implements Runnable {
     @Override
     public void run() {
         String clientInfo = clientSocket.getInetAddress().getHostAddress() + ":" + clientSocket.getPort();
-        log.info("[{}] New connection from.", clientInfo);
+        log.info("[{}] New connection.", clientInfo);
 
         try (BufferedReader in = new BufferedReader(new InputStreamReader(clientSocket.getInputStream()));
              OutputStream out = clientSocket.getOutputStream()) {
@@ -85,6 +87,7 @@ class WebSocketHandler implements Runnable {
 
                     sendWebSocketBinaryMessage(out, fileData);
                 } else {
+                    log.info("[{}] Received message on {}:{}", clientInfo, route, new String(message));
                     sendWebSocketMessage(out, new String(message));
                 }
             }
@@ -148,7 +151,7 @@ class WebSocketHandler implements Runnable {
         }
 
         int opcode = firstByte & 0x0F;
-        if (opcode == 0x08) { // Закрытие соединения
+        if (opcode == 0x08) {
             return null;
         }
 
@@ -200,7 +203,7 @@ class WebSocketHandler implements Runnable {
     private void sendWebSocketBinaryMessage(OutputStream out, byte[] fileData) throws IOException {
         int fileLength = fileData.length;
 
-        out.write(0x82); // 0x82 -> WebSocket Frame с бинарными данными
+        out.write(0x82);
 
         if (fileLength <= 125) {
             out.write(fileLength);
