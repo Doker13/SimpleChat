@@ -1,13 +1,13 @@
 package com.project;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.project.entity.dto.IncomingMessage;
+import com.project.controller.ChatController;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.*;
+import java.lang.reflect.Method;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.nio.file.Files;
 import java.security.MessageDigest;
 import java.util.Base64;
 import java.util.concurrent.ExecutorService;
@@ -22,10 +22,11 @@ public class TcpChatServer {
     public static void main(String[] args) {
         try (ExecutorService threadPool = Executors.newVirtualThreadPerTaskExecutor()) {
             try (ServerSocket serverSocket = new ServerSocket(PORT)) {
+                WebSocketRouteRegistry.registerController(new ChatController());
                 log.info("Server started on port {}", PORT);
                 while (true) {
                     Socket clientSocket = serverSocket.accept();
-                    threadPool.execute(new WebSocketHandler(clientSocket));
+                    threadPool.execute(new WebSocketHandler(clientSocket, threadPool));
                 }
             } catch (IOException e) {
                 log.error("Server error: ", e);
@@ -33,17 +34,20 @@ public class TcpChatServer {
                 threadPool.shutdown();
             }
         } catch (NullPointerException e) {
-            log.error("Can't create thread: ", e);
+            log.error("Can't create thread pool: ", e);
         }
     }
 
     @Slf4j
     static class WebSocketHandler implements Runnable {
         private final Socket clientSocket;
+        private final ExecutorService threadPool;
         private String route;
+        private final WebSocketSession session = new WebSocketSession();
 
-        public WebSocketHandler(Socket socket) {
+        public WebSocketHandler(Socket socket, ExecutorService threadPool) {
             this.clientSocket = socket;
+            this.threadPool = threadPool;
         }
 
         @Override
@@ -62,24 +66,30 @@ public class TcpChatServer {
 
                 log.info("[{}] WebSocket handshake successful! Route: {}", clientInfo, route);
 
-                while (true) {
-                    byte[] message = readWebSocketMessage(clientSocket.getInputStream());
+                boolean isJson = WebSocketRouteRegistry.getJsonHandler(route) != null;
+                boolean isFile = WebSocketRouteRegistry.getFileHandler(route) != null;
 
-                    if (message == null) {
-                        log.info("[{}] Client disconnected from {}", clientInfo, route);
-                        break;
-                    }
-
-                    if (route.equals("/upload")) {
-                        handleFileUpload(clientInfo, out, message);
-                    } else if (route.equals("/download")) {
-                        handleFileDownload(clientInfo, out);
-                    } else if (route.equals("/chat")) {
-                        handleChatMessage(clientInfo, out, message);
-                    } else {
-                        handleDefaultMessage(clientInfo, out, message);
-                    }
+                if (!isJson && !isFile) {
+                    log.warn("[{}] Unknown route: {}", clientInfo, route);
+                    sendWebSocketMessage(out, "{\"error\":\"Unknown route.\"}");
+                    return;
                 }
+
+                threadPool.execute(() -> {
+                    try {
+                        if (isJson) handleJson(clientInfo);
+                        else handleFile(clientInfo);
+                    } catch (IOException e) {
+                        log.error("[{}] Input handler error: ", clientInfo, e);
+                    }
+                });
+
+                try {
+                    handleOutgoingMessages(out);
+                } catch (IOException | InterruptedException e) {
+                    log.error("[{}] Output handler error: ", clientInfo, e);
+                }
+
 
             } catch (IOException e) {
                 log.error("[{}] WebSocket error: ", clientInfo, e);
@@ -93,42 +103,81 @@ public class TcpChatServer {
             }
         }
 
-        private void handleFileUpload(String clientInfo, OutputStream out, byte[] message) throws IOException {
-            log.info("[{}] Received file upload on {}", clientInfo, route);
+        private void handleJson(String clientInfo) throws IOException {
+            InputStream input = clientSocket.getInputStream();
+            while (true) {
+                byte[] message = readWebSocketMessage(input);
+                if (message == null) break;
 
-            File file = new File("uploaded_file");
-            try (FileOutputStream fos = new FileOutputStream(file)) {
-                fos.write(message);
+                String jsonStr = new String(message);
+                try {
+                    var handler = WebSocketRouteRegistry.getJsonHandler(route);
+                    if (handler != null) {
+                        Object controller = WebSocketRouteRegistry.getControllerInstance(handler);
+
+                        try {
+                            Method setSession = controller.getClass().getMethod("setSession", WebSocketSession.class);
+                            setSession.invoke(controller, session);
+                        } catch (NoSuchMethodException e) {
+                            log.error("[{}] Controller do not require sessions: ", clientInfo, e);
+                        }
+
+                        Class<?> paramType = handler.getParameterTypes()[0];
+
+                        Object paramValue;
+                        if (paramType == String.class) {
+                            paramValue = jsonStr;
+                        } else {
+                            paramValue = objectMapper.readValue(jsonStr, paramType);
+                        }
+
+                        handler.invoke(controller, paramValue);
+                    }
+                } catch (Exception e) {
+                    log.error("[{}] JSON route error", clientInfo, e);
+                    session.addOutgoingMessage("{\"error\":\"Invalid JSON or internal error.\"}");
+                }
             }
-
-            sendWebSocketMessage(out, "File received successfully.");
         }
 
-        private void handleFileDownload(String clientInfo, OutputStream out) throws IOException {
-            log.info("[{}] Sending file to {}", clientInfo, route);
+        private void handleFile(String clientInfo) throws IOException {
+            InputStream input = clientSocket.getInputStream();
+            while (true) {
+                byte[] message = readWebSocketMessage(input);
+                if (message == null) break;
 
-            File file = new File("uploaded_file");
-            byte[] fileData = Files.readAllBytes(file.toPath());
+                try {
+                    var handler = WebSocketRouteRegistry.getFileHandler(route);
+                    if (handler != null) {
+                        Object controller = WebSocketRouteRegistry.getControllerInstance(handler);
+                        try {
+                            Method setSession = controller.getClass().getMethod("setSession", WebSocketSession.class);
+                            setSession.invoke(controller, session);
+                        } catch (NoSuchMethodException e) {
+                            log.error("[{}] Controller do not require sessions: ", clientInfo, e);
+                        }
 
-            sendWebSocketBinaryMessage(out, fileData);
-        }
-
-        private void handleChatMessage(String clientInfo, OutputStream out, byte[] message) throws IOException {
-            try {
-                String jsonMessage = new String(message);
-                IncomingMessage incomingMessage = objectMapper.readValue(jsonMessage, IncomingMessage.class);
-                log.info("[{}] Received chat message: {}", clientInfo, incomingMessage);
-
-                sendWebSocketMessage(out, jsonMessage);
-            } catch (IOException e) {
-                log.error("[{}] Invalid message format for /chat endpoint", clientInfo, e);
-                sendWebSocketMessage(out, "{\"error\":\"Invalid message format. Expected IncomingMessage JSON\"}");
+                        handler.invoke(controller, (Object) message);
+                    }
+                } catch (Exception e) {
+                    log.error("[{}] File route error", clientInfo, e);
+                    session.addOutgoingMessage("{\"error\":\"File route error.\"}");
+                }
             }
         }
 
-        private void handleDefaultMessage(String clientInfo, OutputStream out, byte[] message) throws IOException {
-            log.info("[{}] Received message on {}: {}", clientInfo, route, new String(message));
-            sendWebSocketMessage(out, new String(message));
+        private void handleOutgoingMessages(OutputStream out) throws IOException, InterruptedException {
+            while (!clientSocket.isClosed()) {
+                String textMessage = session.pollOutgoingMessage();
+                if (textMessage != null) {
+                    sendWebSocketMessage(out, textMessage);
+                }
+
+                byte[] binaryMessage = session.pollOutgoingBinaryMessage();
+                if (binaryMessage != null) {
+                    sendWebSocketBinaryMessage(out, binaryMessage);
+                }
+            }
         }
 
         private String performHandshake(BufferedReader in, OutputStream out) throws IOException {
