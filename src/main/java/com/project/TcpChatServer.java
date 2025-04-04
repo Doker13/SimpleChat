@@ -18,23 +18,27 @@ public class TcpChatServer {
     private static final int PORT = 8080;
     protected static final String WS_MAGIC_STRING = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     private static final ObjectMapper objectMapper = new ObjectMapper();
+    private static final String HTTP_UPGRADE_RESPONSE = """
+        HTTP/1.1 101 Switching Protocols\r
+        Upgrade: websocket\r
+        Connection: Upgrade\r
+        Sec-WebSocket-Accept: %s\r
+        \r
+        """;
 
     public static void main(String[] args) {
-        try (ExecutorService threadPool = Executors.newVirtualThreadPerTaskExecutor()) {
-            try (ServerSocket serverSocket = new ServerSocket(PORT)) {
-                WebSocketRouteRegistry.registerController(new ChatController());
-                log.info("Server started on port {}", PORT);
-                while (true) {
-                    Socket clientSocket = serverSocket.accept();
-                    threadPool.execute(new WebSocketHandler(clientSocket, threadPool));
-                }
-            } catch (IOException e) {
-                log.error("Server error: ", e);
-            } finally {
-                threadPool.shutdown();
+        try (ServerSocket serverSocket = new ServerSocket(PORT);
+             ExecutorService threadPool = Executors.newVirtualThreadPerTaskExecutor()) {
+
+            WebSocketRouteRegistry.registerController(new ChatController());
+            log.info("Server started on port {}", PORT);
+
+            while (!threadPool.isShutdown()) {
+                Socket clientSocket = serverSocket.accept();
+                threadPool.execute(new WebSocketHandler(clientSocket, threadPool));
             }
-        } catch (NullPointerException e) {
-            log.error("Can't create thread pool: ", e);
+        } catch (IOException e) {
+            log.error("Server error: ", e);
         }
     }
 
@@ -52,117 +56,91 @@ public class TcpChatServer {
 
         @Override
         public void run() {
-            String clientInfo = clientSocket.getInetAddress().getHostAddress() + ":" + clientSocket.getPort();
+            String clientInfo = getClientInfo();
             log.info("[{}] New connection.", clientInfo);
 
             try (BufferedReader in = new BufferedReader(new InputStreamReader(clientSocket.getInputStream()));
                  OutputStream out = clientSocket.getOutputStream()) {
 
-                String webSocketKey = performHandshake(in, out);
-                if (webSocketKey == null) {
+                if (performHandshake(in, out)) {
+                    log.info("[{}] WebSocket handshake successful! Route: {}", clientInfo, route);
+                    handleClientConnection(out, clientInfo);
+                } else {
                     log.error("[{}] WebSocket handshake failed!", clientInfo);
-                    return;
                 }
-
-                log.info("[{}] WebSocket handshake successful! Route: {}", clientInfo, route);
-
-                boolean isJson = WebSocketRouteRegistry.getJsonHandler(route) != null;
-                boolean isFile = WebSocketRouteRegistry.getFileHandler(route) != null;
-
-                if (!isJson && !isFile) {
-                    log.warn("[{}] Unknown route: {}", clientInfo, route);
-                    sendWebSocketMessage(out, "{\"error\":\"Unknown route.\"}");
-                    return;
-                }
-
-                threadPool.execute(() -> {
-                    try {
-                        if (isJson) handleJson(clientInfo);
-                        else handleFile(clientInfo);
-                    } catch (IOException e) {
-                        log.error("[{}] Input handler error: ", clientInfo, e);
-                    }
-                });
-
-                try {
-                    handleOutgoingMessages(out);
-                } catch (IOException | InterruptedException e) {
-                    log.error("[{}] Output handler error: ", clientInfo, e);
-                }
-
-
             } catch (IOException e) {
                 log.error("[{}] WebSocket error: ", clientInfo, e);
             } finally {
+                closeClientConnection(clientInfo);
+            }
+        }
+
+        private void handleClientConnection(OutputStream out, String clientInfo) throws IOException {
+            boolean isJson = WebSocketRouteRegistry.getJsonHandler(route) != null;
+            boolean isFile = WebSocketRouteRegistry.getFileHandler(route) != null;
+
+            if (!isJson && !isFile) {
+                log.warn("[{}] Unknown route: {}", clientInfo, route);
+                sendWebSocketFrame(out, "{\"error\":\"Unknown route.\"}".getBytes(), false);
+                return;
+            }
+
+            threadPool.execute(() -> {
                 try {
-                    clientSocket.close();
-                    log.info("[{}] Connection closed.", clientInfo);
+                    handleClientData(clientInfo, isJson);
                 } catch (IOException e) {
-                    log.error("[{}] Error closing client socket: ", clientInfo, e);
+                    log.error("[{}] Input handler error: ", clientInfo, e);
                 }
+            });
+
+            try {
+                handleOutgoingMessages(out);
+            } catch (IOException | InterruptedException e) {
+                log.error("[{}] Output handler error: ", clientInfo, e);
             }
         }
 
-        private void handleJson(String clientInfo) throws IOException {
+        private void handleClientData(String clientInfo, boolean isJson) throws IOException {
             InputStream input = clientSocket.getInputStream();
             while (true) {
                 byte[] message = readWebSocketMessage(input);
                 if (message == null) break;
 
-                String jsonStr = new String(message);
                 try {
-                    var handler = WebSocketRouteRegistry.getJsonHandler(route);
+                    var handler = isJson ? WebSocketRouteRegistry.getJsonHandler(route)
+                            : WebSocketRouteRegistry.getFileHandler(route);
                     if (handler != null) {
                         Object controller = WebSocketRouteRegistry.getControllerInstance(handler);
+                        injectSession(controller, clientInfo);
 
-                        try {
-                            Method setSession = controller.getClass().getMethod("setSession", WebSocketSession.class);
-                            setSession.invoke(controller, session);
-                        } catch (NoSuchMethodException e) {
-                            log.error("[{}] Controller do not require sessions: ", clientInfo, e);
-                        }
-
-                        Class<?> paramType = handler.getParameterTypes()[0];
-
-                        Object paramValue;
-                        if (paramType == String.class) {
-                            paramValue = jsonStr;
+                        if (isJson) {
+                            handleJsonMessage(handler, controller, message);
                         } else {
-                            paramValue = objectMapper.readValue(jsonStr, paramType);
+                            handler.invoke(controller, (Object) message);
                         }
-
-                        handler.invoke(controller, paramValue);
                     }
                 } catch (Exception e) {
-                    log.error("[{}] JSON route error", clientInfo, e);
-                    session.addOutgoingMessage("{\"error\":\"Invalid JSON or internal error.\"}");
+                    log.error("[{}] {} route error", clientInfo, isJson ? "JSON" : "File", e);
+                    session.addOutgoingMessage("{\"error\":\"" + (isJson ? "Invalid JSON" : "File processing") + " error.\"}");
                 }
             }
         }
 
-        private void handleFile(String clientInfo) throws IOException {
-            InputStream input = clientSocket.getInputStream();
-            while (true) {
-                byte[] message = readWebSocketMessage(input);
-                if (message == null) break;
+        private void handleJsonMessage(Method handler, Object controller, byte[] message) throws Exception {
+            String jsonStr = new String(message);
+            Class<?> paramType = handler.getParameterTypes()[0];
+            Object paramValue = paramType == String.class ? jsonStr : objectMapper.readValue(jsonStr, paramType);
+            handler.invoke(controller, paramValue);
+        }
 
-                try {
-                    var handler = WebSocketRouteRegistry.getFileHandler(route);
-                    if (handler != null) {
-                        Object controller = WebSocketRouteRegistry.getControllerInstance(handler);
-                        try {
-                            Method setSession = controller.getClass().getMethod("setSession", WebSocketSession.class);
-                            setSession.invoke(controller, session);
-                        } catch (NoSuchMethodException e) {
-                            log.error("[{}] Controller do not require sessions: ", clientInfo, e);
-                        }
-
-                        handler.invoke(controller, (Object) message);
-                    }
-                } catch (Exception e) {
-                    log.error("[{}] File route error", clientInfo, e);
-                    session.addOutgoingMessage("{\"error\":\"File route error.\"}");
-                }
+        private void injectSession(Object controller, String clientInfo) {
+            try {
+                Method setSession = controller.getClass().getMethod("setSession", WebSocketSession.class);
+                setSession.invoke(controller, session);
+            } catch (NoSuchMethodException e) {
+                log.debug("[{}] Controller doesn't require session", clientInfo);
+            } catch (Exception e) {
+                log.error("[{}] Error injecting session", clientInfo, e);
             }
         }
 
@@ -170,49 +148,45 @@ public class TcpChatServer {
             while (!clientSocket.isClosed()) {
                 String textMessage = session.pollOutgoingMessage();
                 if (textMessage != null) {
-                    sendWebSocketMessage(out, textMessage);
+                    sendWebSocketFrame(out, textMessage.getBytes(), false);
                 }
 
                 byte[] binaryMessage = session.pollOutgoingBinaryMessage();
                 if (binaryMessage != null) {
-                    sendWebSocketBinaryMessage(out, binaryMessage);
+                    sendWebSocketFrame(out, binaryMessage, true);
                 }
             }
         }
 
-        private String performHandshake(BufferedReader in, OutputStream out) throws IOException {
+        private boolean performHandshake(BufferedReader in, OutputStream out) throws IOException {
             String line;
             String webSocketKey = null;
+            String path = null;
 
             while (!(line = in.readLine()).isEmpty()) {
                 if (line.startsWith("GET ")) {
-                    route = line.split(" ")[1];
+                    path = line.split(" ")[1];
                 } else if (line.startsWith("Sec-WebSocket-Key: ")) {
                     webSocketKey = line.substring(19);
                 }
             }
 
-            if (webSocketKey == null || route == null) {
-                return null;
+            if (webSocketKey == null || path == null) {
+                return false;
             }
 
+            this.route = path;
             String acceptKey = generateWebSocketAcceptKey(webSocketKey);
-
-            String response = "HTTP/1.1 101 Switching Protocols\r\n" +
-                    "Upgrade: websocket\r\n" +
-                    "Connection: Upgrade\r\n" +
-                    "Sec-WebSocket-Accept: " + acceptKey + "\r\n\r\n";
-
-            out.write(response.getBytes());
+            out.write(String.format(HTTP_UPGRADE_RESPONSE, acceptKey).getBytes());
             out.flush();
 
-            return webSocketKey;
+            return true;
         }
 
         private String generateWebSocketAcceptKey(String webSocketKey) {
             try {
                 MessageDigest md = MessageDigest.getInstance("SHA-1");
-                md.update((webSocketKey + TcpChatServer.WS_MAGIC_STRING).getBytes());
+                md.update((webSocketKey + WS_MAGIC_STRING).getBytes());
                 return Base64.getEncoder().encodeToString(md.digest());
             } catch (Exception e) {
                 throw new RuntimeException("Failed to generate WebSocket accept key", e);
@@ -221,18 +195,12 @@ public class TcpChatServer {
 
         private byte[] readWebSocketMessage(InputStream input) throws IOException {
             int firstByte = input.read();
-            if (firstByte == -1) {
+            if (firstByte == -1 || (firstByte & 0x0F) == 0x08) {
                 return null;
             }
 
-            int opcode = firstByte & 0x0F;
-            if (opcode == 0x08) {
-                return null;
-            }
-
-            boolean isBinary = opcode == 0x02;
-
-            int payloadLength = input.read() & 127;
+            int secondByte = input.read();
+            int payloadLength = secondByte & 127;
 
             if (payloadLength == 126) {
                 payloadLength = (input.read() << 8) | input.read();
@@ -241,56 +209,47 @@ public class TcpChatServer {
             }
 
             byte[] mask = new byte[4];
-            input.read(mask, 0, 4);
+            input.readNBytes(mask, 0, 4);
 
-            byte[] encodedMessage = new byte[payloadLength];
-            input.read(encodedMessage, 0, payloadLength);
-
-            byte[] decodedMessage = new byte[payloadLength];
+            byte[] encoded = input.readNBytes(payloadLength);
+            byte[] decoded = new byte[payloadLength];
             for (int i = 0; i < payloadLength; i++) {
-                decodedMessage[i] = (byte) (encodedMessage[i] ^ mask[i % 4]);
+                decoded[i] = (byte) (encoded[i] ^ mask[i % 4]);
             }
 
-            return isBinary ? decodedMessage : new String(decodedMessage).getBytes();
+            return decoded;
         }
 
-        private void sendWebSocketMessage(OutputStream out, String message) throws IOException {
-            byte[] messageBytes = message.getBytes();
-            int messageLength = messageBytes.length;
+        private void sendWebSocketFrame(OutputStream out, byte[] data, boolean isBinary) throws IOException {
+            int dataLength = data.length;
 
-            out.write(0x81);
+            out.write(isBinary ? 0x82 : 0x81);
 
-            if (messageLength <= 125) {
-                out.write(messageLength);
-            } else if (messageLength <= 65535) {
+            if (dataLength <= 125) {
+                out.write(dataLength);
+            } else if (dataLength <= 65535) {
                 out.write(126);
-                out.write((messageLength >> 8) & 0xFF);
-                out.write(messageLength & 0xFF);
+                out.write((dataLength >> 8) & 0xFF);
+                out.write(dataLength & 0xFF);
             } else {
-                throw new IOException("Message too large");
+                throw new IOException("Payload too large");
             }
 
-            out.write(messageBytes);
+            out.write(data);
             out.flush();
         }
 
-        private void sendWebSocketBinaryMessage(OutputStream out, byte[] fileData) throws IOException {
-            int fileLength = fileData.length;
+        private String getClientInfo() {
+            return clientSocket.getInetAddress().getHostAddress() + ":" + clientSocket.getPort();
+        }
 
-            out.write(0x82);
-
-            if (fileLength <= 125) {
-                out.write(fileLength);
-            } else if (fileLength <= 65535) {
-                out.write(126);
-                out.write((fileLength >> 8) & 0xFF);
-                out.write(fileLength & 0xFF);
-            } else {
-                throw new IOException("File too large");
+        private void closeClientConnection(String clientInfo) {
+            try {
+                clientSocket.close();
+                log.info("[{}] Connection closed.", clientInfo);
+            } catch (IOException e) {
+                log.error("[{}] Error closing client socket: ", clientInfo, e);
             }
-
-            out.write(fileData);
-            out.flush();
         }
     }
 }
