@@ -8,33 +8,21 @@ import java.util.concurrent.LinkedBlockingQueue;
 
 public class WebSocketSession {
     private static final ObjectMapper objectMapper = new ObjectMapper();
-    private final BlockingQueue<String> outgoingMessages = new LinkedBlockingQueue<>();
-    private final BlockingQueue<byte[]> outgoingBinaryMessages = new LinkedBlockingQueue<>();
+    private final BlockingQueue<MessageWrapper> outgoingMessages = new LinkedBlockingQueue<>();
+
+    public record MessageWrapper(byte[] data, boolean isBinary) {}
 
     @SneakyThrows
-    public void addOutgoingMessage(Object message) {
-        String json;
-        if (message instanceof String) {
-            json = (String) message;
+    public void send(Object message) {
+        if (message instanceof byte[] bytes) {
+            outgoingMessages.put(new MessageWrapper(bytes, true));
         } else {
-            json = objectMapper.writeValueAsString(message);
+            String json = message instanceof String str ? str : objectMapper.writeValueAsString(message);
+            outgoingMessages.put(new MessageWrapper(json.getBytes(), false));
         }
-        outgoingMessages.put(json);
     }
 
-    public void addOutgoingMessage(String message) {
-        outgoingMessages.add(message);
-    }
-
-    public void addOutgoingBinaryMessage(byte[] data) {
-        outgoingBinaryMessages.add(data);
-    }
-
-    public String pollOutgoingMessage() throws InterruptedException {
+    public MessageWrapper poll() throws InterruptedException {
         return outgoingMessages.take();
-    }
-
-    public byte[] pollOutgoingBinaryMessage() throws InterruptedException {
-        return outgoingBinaryMessages.take();
     }
 }

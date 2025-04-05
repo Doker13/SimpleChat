@@ -76,18 +76,9 @@ public class TcpChatServer {
         }
 
         private void handleClientConnection(OutputStream out, String clientInfo) throws IOException {
-            boolean isJson = WebSocketRouteRegistry.getJsonHandler(route) != null;
-            boolean isFile = WebSocketRouteRegistry.getFileHandler(route) != null;
-
-            if (!isJson && !isFile) {
-                log.warn("[{}] Unknown route: {}", clientInfo, route);
-                sendWebSocketFrame(out, "{\"error\":\"Unknown route.\"}".getBytes(), false);
-                return;
-            }
-
             threadPool.execute(() -> {
                 try {
-                    handleClientData(clientInfo, isJson);
+                    handleClientData(clientInfo);
                 } catch (IOException e) {
                     log.error("[{}] Input handler error: ", clientInfo, e);
                 }
@@ -100,37 +91,61 @@ public class TcpChatServer {
             }
         }
 
-        private void handleClientData(String clientInfo, boolean isJson) throws IOException {
+        private void handleClientData(String clientInfo) throws IOException {
             InputStream input = clientSocket.getInputStream();
+            WebSocketRouteRegistry.RouteHandler handler = WebSocketRouteRegistry.getHandler(route);
+
+            if (handler == null) {
+                log.warn("[{}] Unknown route: {}", clientInfo, route);
+                session.send("{\"error\":\"Unknown route.\"}");
+                return;
+            }
+
             while (true) {
-                byte[] message = readWebSocketMessage(input);
+                int firstByte = input.read();
+                if (firstByte == -1) break;
+
+                int opcode = firstByte & 0x0F;
+
+                if ((handler.isBinary() && opcode != 0x02) || (!handler.isBinary() && opcode != 0x01)) {
+                    String errorMsg = handler.isBinary()
+                            ? "Expected binary data but received text message"
+                            : "Expected text message but received binary data";
+                    session.send("{\"error\":\"" + errorMsg + "\"}");
+                    log.error("[{}] {}", clientInfo, errorMsg);
+                    clientSocket.close();
+                    break;
+                }
+
+                byte[] message = readWebSocketFrame(firstByte, input);
                 if (message == null) break;
 
                 try {
-                    var handler = isJson ? WebSocketRouteRegistry.getJsonHandler(route)
-                            : WebSocketRouteRegistry.getFileHandler(route);
-                    if (handler != null) {
-                        Object controller = WebSocketRouteRegistry.getControllerInstance(handler);
-                        injectSession(controller, clientInfo);
+                    Object controller = WebSocketRouteRegistry.getControllerInstance(handler.getMethod());
+                    injectSession(controller, clientInfo);
 
-                        if (isJson) {
-                            handleJsonMessage(handler, controller, message);
-                        } else {
-                            handler.invoke(controller, (Object) message);
-                        }
+                    if (handler.isBinary()) {
+                        handler.getMethod().invoke(controller, (Object) message);
+                    } else {
+                        handleTextMessage(handler, controller, message);
                     }
                 } catch (Exception e) {
-                    log.error("[{}] {} route error", clientInfo, isJson ? "JSON" : "File", e);
-                    session.addOutgoingMessage("{\"error\":\"" + (isJson ? "Invalid JSON" : "File processing") + " error.\"}");
+                    log.error("[{}] Error processing message", clientInfo, e);
+                    session.send("{\"error\":\"Message processing error\"}");
                 }
             }
         }
 
-        private void handleJsonMessage(Method handler, Object controller, byte[] message) throws Exception {
-            String jsonStr = new String(message);
-            Class<?> paramType = handler.getParameterTypes()[0];
-            Object paramValue = paramType == String.class ? jsonStr : objectMapper.readValue(jsonStr, paramType);
-            handler.invoke(controller, paramValue);
+        private void handleTextMessage(WebSocketRouteRegistry.RouteHandler handler, Object controller, byte[] message) throws Exception {
+            String text = new String(message);
+            Class<?> paramType = handler.getMethod().getParameterTypes()[0];
+
+            if (paramType == String.class) {
+                handler.getMethod().invoke(controller, text);
+            } else {
+                Object paramValue = objectMapper.readValue(text, paramType);
+                handler.getMethod().invoke(controller, paramValue);
+            }
         }
 
         private void injectSession(Object controller, String clientInfo) {
@@ -146,15 +161,8 @@ public class TcpChatServer {
 
         private void handleOutgoingMessages(OutputStream out) throws IOException, InterruptedException {
             while (!clientSocket.isClosed()) {
-                String textMessage = session.pollOutgoingMessage();
-                if (textMessage != null) {
-                    sendWebSocketFrame(out, textMessage.getBytes(), false);
-                }
-
-                byte[] binaryMessage = session.pollOutgoingBinaryMessage();
-                if (binaryMessage != null) {
-                    sendWebSocketFrame(out, binaryMessage, true);
-                }
+                var message = session.poll();
+                sendWebSocketFrame(out, message.data(), message.isBinary());
             }
         }
 
@@ -193,9 +201,10 @@ public class TcpChatServer {
             }
         }
 
-        private byte[] readWebSocketMessage(InputStream input) throws IOException {
-            int firstByte = input.read();
-            if (firstByte == -1 || (firstByte & 0x0F) == 0x08) {
+        private byte[] readWebSocketFrame(int firstByte, InputStream input) throws IOException {
+            int opcode = firstByte & 0x0F;
+
+            if (opcode == 0x08) {
                 return null;
             }
 
