@@ -5,6 +5,7 @@ import lombok.SneakyThrows;
 
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 
 public class WebSocketSession {
     private static final ObjectMapper objectMapper = new ObjectMapper();
@@ -22,7 +23,7 @@ public class WebSocketSession {
         }
     }
 
-    public MessageWrapper poll() throws InterruptedException {
+    public MessageWrapper poll(int i, TimeUnit milliseconds) throws InterruptedException {
         return outgoingMessages.take();
     }
 }

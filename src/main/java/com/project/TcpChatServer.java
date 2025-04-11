@@ -76,7 +76,7 @@ public class TcpChatServer {
         }
 
         private void handleClientConnection(OutputStream out, String clientInfo) throws IOException {
-            threadPool.execute(() -> {
+            var inputHandler = threadPool.submit(() -> {
                 try {
                     handleClientData(clientInfo);
                 } catch (IOException e) {
@@ -88,6 +88,8 @@ public class TcpChatServer {
                 handleOutgoingMessages(out);
             } catch (IOException | InterruptedException e) {
                 log.error("[{}] Output handler error: ", clientInfo, e);
+            } finally {
+                inputHandler.cancel(true);
             }
         }
 
@@ -107,15 +109,24 @@ public class TcpChatServer {
 
                 int opcode = firstByte & 0x0F;
 
+                if (opcode == 0x08) {
+                    log.info("[{}] Connection closed gracefully.", clientInfo);
+                    sendCloseFrame(clientSocket.getOutputStream());
+                    break;
+                }
+
                 if ((handler.isBinary() && opcode != 0x02) || (!handler.isBinary() && opcode != 0x01)) {
                     String errorMsg = handler.isBinary()
                             ? "Expected binary data but received text message"
                             : "Expected text message but received binary data";
-                    session.send("{\"error\":\"" + errorMsg + "\"}");
                     log.error("[{}] {}", clientInfo, errorMsg);
+                    session.send("{\"error\":\"" + errorMsg + "\"}");
+
+                    sendCloseFrame(clientSocket.getOutputStream());
                     clientSocket.close();
                     break;
                 }
+
 
                 byte[] message = readWebSocketFrame(firstByte, input);
                 if (message == null) break;
@@ -160,9 +171,21 @@ public class TcpChatServer {
         }
 
         private void handleOutgoingMessages(OutputStream out) throws IOException, InterruptedException {
-            while (!clientSocket.isClosed()) {
-                var message = session.poll();
-                sendWebSocketFrame(out, message.data(), message.isBinary());
+            try {
+                while (!clientSocket.isClosed()) {
+                    var message = session.poll(100, java.util.concurrent.TimeUnit.MILLISECONDS);
+                    if (message == null) {
+                        if (clientSocket.isInputShutdown() || Thread.currentThread().isInterrupted()) {
+                            break;
+                        }
+                        continue;
+                    }
+                    sendWebSocketFrame(out, message.data(), message.isBinary());
+                }
+            } catch (IOException e) {
+                if (!clientSocket.isClosed()) {
+                    throw e;
+                }
             }
         }
 
@@ -254,11 +277,27 @@ public class TcpChatServer {
 
         private void closeClientConnection(String clientInfo) {
             try {
-                clientSocket.close();
-                log.info("[{}] Connection closed.", clientInfo);
+                if (!clientSocket.isClosed()) {
+                    if (!clientSocket.isOutputShutdown()) {
+                        sendCloseFrame(clientSocket.getOutputStream());
+                    }
+                    clientSocket.close();
+                }
+                log.info("[{}] Connection closed gracefully.", clientInfo);
             } catch (IOException e) {
                 log.error("[{}] Error closing client socket: ", clientInfo, e);
             }
+        }
+
+        private void sendCloseFrame(OutputStream out) throws IOException {
+            if (clientSocket.isClosed() || clientSocket.isOutputShutdown()) return;
+
+            byte[] payload = { (byte)(1000 >> 8), (byte)(1000 & 0xFF) };
+
+            out.write(0x88); // FIN + opcode 0x8
+            out.write(payload.length);
+            out.write(payload);
+            out.flush();
         }
     }
 }
