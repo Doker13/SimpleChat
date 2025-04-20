@@ -1,7 +1,6 @@
 package com.project;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.project.controller.ChatController;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.*;
@@ -30,7 +29,7 @@ public class TcpChatServer {
         try (ServerSocket serverSocket = new ServerSocket(PORT);
              ExecutorService threadPool = Executors.newVirtualThreadPerTaskExecutor()) {
 
-            WebSocketRouteRegistry.registerController(new ChatController());
+            WebSocketAutoRegistrar.scanAndRegister("com.project.controller");
             log.info("Server started on port {}", PORT);
 
             while (!threadPool.isShutdown()) {
