@@ -5,7 +5,6 @@ import com.project.annotation.WebSocketRoute;
 import com.project.entity.dto.AuthRequest;
 import com.project.entity.dto.AuthResponse;
 import com.project.service.AuthService;
-import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 
 @Slf4j
