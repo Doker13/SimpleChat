@@ -29,7 +29,7 @@ public class WebSocketAutoRegistrar {
 
         for (Class<?> controllerClass : controllerClasses) {
             try {
-                Object controllerInstance = controllerClass.getDeclaredConstructor().newInstance();
+                Object controllerInstance = DIContainer.createOrGetInstance(controllerClass);
                 WebSocketRouteRegistry.registerController(controllerInstance);
             } catch (Exception e) {
                 log.error(e.getMessage());

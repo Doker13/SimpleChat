@@ -8,8 +8,8 @@ import com.project.service.AuthService;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 
-@Setter
 @Slf4j
+@Setter
 public class ChatController {
     private WebSocketSession session;
     private static AuthService authService;
@@ -18,7 +18,7 @@ public class ChatController {
         this.authService = authService;
     }
 
-    @WebSocketRoute("/chat")
+    @WebSocketRoute("/login")
     public void handleChat(AuthRequest request) {
         AuthResponse response = authService.authenticate(request);
         session.send(response);
