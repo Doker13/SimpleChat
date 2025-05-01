@@ -15,9 +15,9 @@ public class DatabaseManager {
 
     static {
         HikariConfig config = new HikariConfig();
-        config.setJdbcUrl("jdbc:postgresql://localhost:5432/SimpleChat");
-        config.setUsername("artem");
-        config.setPassword("28081978");
+        config.setJdbcUrl(System.getenv("DB_URL"));
+        config.setUsername(System.getenv("DB_USERNAME"));
+        config.setPassword(System.getenv("DB_PASSWORD"));
 
         config.setMaximumPoolSize(10);
         config.setMinimumIdle(2);
