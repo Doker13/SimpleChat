@@ -1,5 +1,7 @@
 package com.project;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 
@@ -8,9 +10,11 @@ import java.lang.reflect.Method;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.security.MessageDigest;
-import java.util.Base64;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 @Slf4j
 public class TcpChatServer {
@@ -46,16 +50,38 @@ public class TcpChatServer {
         private final Socket clientSocket;
         private final ExecutorService threadPool;
         private String route;
+        private final String clientInfo;
         private final WebSocketSession session = new WebSocketSession();
+
+        private static class FileUploadState {
+            String command;
+            WebSocketRouteRegistry.RouteHandler handler;
+            Object metadata;
+            long totalSize;
+            int totalChunks;
+            List<byte[]> receivedChunks = new ArrayList<>();
+            boolean expectingBinary = false;
+            String currentFileId;
+
+            void addChunk(byte[] chunk) {
+                receivedChunks.add(chunk);
+            }
+
+            boolean isComplete() {
+                return receivedChunks.size() == totalChunks;
+            }
+        }
+
+        private final Map<String, FileUploadState> fileUploads = new ConcurrentHashMap<>();
 
         public WebSocketHandler(Socket socket, ExecutorService threadPool) {
             this.clientSocket = socket;
             this.threadPool = threadPool;
+            this.clientInfo = clientSocket.getInetAddress().getHostAddress() + ":" + clientSocket.getPort();
         }
 
         @Override
         public void run() {
-            String clientInfo = getClientInfo();
             log.info("[{}] New connection.", clientInfo);
 
             try (BufferedReader in = new BufferedReader(new InputStreamReader(clientSocket.getInputStream()));
@@ -63,21 +89,21 @@ public class TcpChatServer {
 
                 if (performHandshake(in, out)) {
                     log.info("[{}] WebSocket handshake successful! Route: {}", clientInfo, route);
-                    handleClientConnection(out, clientInfo);
+                    handleClientConnection(out);
                 } else {
                     log.error("[{}] WebSocket handshake failed!", clientInfo);
                 }
             } catch (IOException e) {
                 log.error("[{}] WebSocket error: ", clientInfo, e);
             } finally {
-                closeClientConnection(clientInfo);
+                closeClientConnection();
             }
         }
 
-        private void handleClientConnection(OutputStream out, String clientInfo) throws IOException {
+        private void handleClientConnection(OutputStream out) throws IOException {
             var inputHandler = threadPool.submit(() -> {
                 try {
-                    handleClientData(clientInfo);
+                    handleClientData();
                 } catch (IOException e) {
                     log.error("[{}] Input handler error: ", clientInfo, e);
                 }
@@ -92,15 +118,8 @@ public class TcpChatServer {
             }
         }
 
-        private void handleClientData(String clientInfo) throws IOException {
+        private void handleClientData() throws IOException {
             InputStream input = clientSocket.getInputStream();
-            WebSocketRouteRegistry.RouteHandler handler = WebSocketRouteRegistry.getHandler(route);
-
-            if (handler == null) {
-                log.warn("[{}] Unknown route: {}", clientInfo, route);
-                session.send("{\"error\":\"Unknown route.\"}");
-                return;
-            }
 
             while (true) {
                 int firstByte = input.read();
@@ -109,56 +128,216 @@ public class TcpChatServer {
                 int opcode = firstByte & 0x0F;
 
                 if (opcode == 0x08) {
-                    log.info("[{}] Connection closed gracefully.", clientInfo);
-                    sendCloseFrame(clientSocket.getOutputStream());
+                    closeClientConnection();
                     break;
                 }
-
-                if ((handler.isBinary() && opcode != 0x02) || (!handler.isBinary() && opcode != 0x01)) {
-                    String errorMsg = handler.isBinary()
-                            ? "Expected binary data but received text message"
-                            : "Expected text message but received binary data";
-                    log.error("[{}] {}", clientInfo, errorMsg);
-                    session.send("{\"error\":\"" + errorMsg + "\"}");
-
-                    sendCloseFrame(clientSocket.getOutputStream());
-                    clientSocket.close();
-                    break;
-                }
-
 
                 byte[] message = readWebSocketFrame(firstByte, input);
                 if (message == null) break;
 
                 try {
-                    Object controller = WebSocketRouteRegistry.getControllerInstance(handler.getMethod());
-                    injectSession(controller, clientInfo);
-
-                    if (handler.isBinary()) {
-                        handler.getMethod().invoke(controller, (Object) message);
+                    if (opcode == 0x02) {
+                        handleBinaryFrame(message);
+                    } else if (opcode == 0x01) {
+                        handleTextFrame(message);
                     } else {
-                        handleTextMessage(handler, controller, message);
+                        log.warn("[{}] Unsupported frame opcode: {}", clientInfo, opcode);
+                        session.send("error","{\"error\":\"Unsupported frame type\"}");
                     }
                 } catch (Exception e) {
                     log.error("[{}] Error processing message", clientInfo, e);
-                    session.send("{\"error\":\"Message processing error\"}");
+                    session.send("error","{\"error\":\"Server error\"}");
                 }
             }
         }
 
-        private void handleTextMessage(WebSocketRouteRegistry.RouteHandler handler, Object controller, byte[] message) throws Exception {
-            String text = new String(message);
-            Class<?> paramType = handler.getMethod().getParameterTypes()[0];
+        private void handleTextFrame(byte[] messageData) throws Exception {
+            String message = new String(messageData);
+            JsonNode jsonNode = objectMapper.readTree(message);
 
-            if (paramType == String.class) {
-                handler.getMethod().invoke(controller, text);
-            } else {
-                Object paramValue = objectMapper.readValue(text, paramType);
-                handler.getMethod().invoke(controller, paramValue);
+            validateRequiredFields(jsonNode);
+
+            String command = jsonNode.get("command").asText();
+            MessageType type = MessageType.fromString(jsonNode.get("type").asText());
+
+            WebSocketRouteRegistry.RouteHandler handler = WebSocketRouteRegistry.getHandler(route, command);
+
+            if (handler == null) {
+                throw new IllegalArgumentException("No handler found for command: " + command);
+            }
+
+            switch (type) {
+                case META_DATA:
+                    validateMetaDataFields(jsonNode);
+                    handleMetaDataFrame(jsonNode, handler);
+                    break;
+
+                case PRE_CHUNK:
+                    validatePreChunkFields(jsonNode);
+                    handlePreChunkFrame(jsonNode, handler);
+                    break;
+
+                case TEXT:
+                    validateRegularMessageFields(jsonNode);
+                    processRegularMessage(jsonNode, handler);
+                    break;
             }
         }
 
-        private void injectSession(Object controller, String clientInfo) {
+        private void validateRequiredFields(JsonNode jsonNode) {
+            if (!jsonNode.has("command")) {
+                throw new IllegalArgumentException("Message must contain 'command' field");
+            } else if (!jsonNode.has("type")) {
+                throw new IllegalArgumentException("Message must contain 'type' field");
+            }
+
+            try {
+                MessageType.fromString(jsonNode.get("type").asText());
+            } catch (IllegalArgumentException e) {
+                throw new IllegalArgumentException("Invalid message type");
+            }
+        }
+
+        private void validateMetaDataFields(JsonNode jsonNode) {
+            if (!jsonNode.has("id")) {
+                throw new IllegalArgumentException("Message must contain file id");
+            } else if (!jsonNode.has("fileSize")) {
+                throw new IllegalArgumentException("Message must contain size of file");
+            } else if (!jsonNode.has("totalChunks")) {
+                throw new IllegalArgumentException("Message must contain number of chunks");
+            }
+        }
+
+        private void validatePreChunkFields(JsonNode jsonNode) {
+            if (!jsonNode.has("id")) {
+                throw new IllegalArgumentException("Message must contain file id");
+            } else if (!jsonNode.has("chunkSize")) {
+                throw new IllegalArgumentException("Message must contain size of chunk");
+            } else if (!jsonNode.has("chunkNum")) {
+                throw new IllegalArgumentException("Message must contain chunk number");
+            }
+        }
+
+        private void validateRegularMessageFields(JsonNode jsonNode) {
+            if (!jsonNode.has("message")) {
+                throw new IllegalArgumentException("Message must contain 'message' field");
+            }
+        }
+
+        private void handleMetaDataFrame(JsonNode jsonNode, WebSocketRouteRegistry.RouteHandler handler) {
+            if (!handler.isBinary()) {
+                throw new IllegalArgumentException("Handler for command " + jsonNode.get("command").asText() + " is not binary");
+            }
+
+            String fileId = jsonNode.get("id").asText();
+            if (fileUploads.containsKey(fileId)) {
+                throw new IllegalStateException("File upload with id " + fileId + " already in progress");
+            }
+
+            FileUploadState uploadState = new FileUploadState();
+            uploadState.command = jsonNode.get("command").asText();
+            uploadState.handler = handler;
+            uploadState.totalSize = jsonNode.get("fileSize").asLong();
+            uploadState.totalChunks = jsonNode.get("totalChunks").asInt();
+
+            try {
+                if (jsonNode.has("message")) {
+                    JsonNode messageNode = jsonNode.get("message");
+                    uploadState.metadata = objectMapper.treeToValue(
+                            messageNode,
+                            handler.getMethod().getParameterTypes()[0]
+                    );
+                }
+            } catch (JsonProcessingException e) {
+                throw new IllegalArgumentException("Invalid metadata format in 'message' field", e);
+            }
+
+            fileUploads.put(fileId, uploadState);
+        }
+
+        private void handlePreChunkFrame(JsonNode jsonNode, WebSocketRouteRegistry.RouteHandler handler) {
+            if (!handler.isBinary()) {
+                throw new IllegalArgumentException("Handler for command " + jsonNode.get("command").asText() + " is not binary");
+            }
+
+            String fileId = jsonNode.get("id").asText();
+            FileUploadState uploadState = fileUploads.get(fileId);
+
+            if (uploadState == null) {
+                throw new IllegalStateException("No file upload with id " + fileId + " in progress");
+            }
+
+            int chunkNum = jsonNode.get("chunkNum").asInt();
+            long chunkSize = jsonNode.get("chunkSize").asLong();
+
+            if (chunkNum != uploadState.receivedChunks.size()) {
+                throw new IllegalStateException("Invalid chunk sequence for file " + fileId +
+                        ". Expected: " + uploadState.receivedChunks.size() +
+                        ", got: " + chunkNum);
+            }
+
+            uploadState.expectingBinary = true;
+            uploadState.currentFileId = fileId;
+        }
+
+        private void handleBinaryFrame(byte[] binaryData) throws Exception {
+
+            FileUploadState uploadState = fileUploads.values().stream()
+                    .filter(state -> state.expectingBinary && state.currentFileId != null)
+                    .findFirst()
+                    .orElseThrow(() -> new IllegalStateException("Unexpected binary data received"));
+
+            String fileId = uploadState.currentFileId;
+
+            uploadState.addChunk(binaryData);
+            uploadState.expectingBinary = false;
+            uploadState.currentFileId = null;
+
+            if (uploadState.isComplete()) {
+                completeFileUpload(fileId, uploadState);
+                fileUploads.remove(fileId);
+            }
+        }
+
+        private void completeFileUpload(String fileId, FileUploadState uploadState)
+                throws Exception {
+            byte[] fileData = new byte[(int) uploadState.totalSize];
+            int offset = 0;
+            for (byte[] chunk : uploadState.receivedChunks) {
+                System.arraycopy(chunk, 0, fileData, offset, chunk.length);
+                offset += chunk.length;
+            }
+
+            Object controller = WebSocketRouteRegistry.getControllerInstance(uploadState.handler.getMethod());
+            injectSession(controller);
+
+            uploadState.handler.getMethod().invoke(controller, uploadState.metadata, fileData);
+
+            log.info("[{}] File {} uploaded successfully", clientInfo, fileId);
+        }
+
+        private void processRegularMessage(JsonNode jsonNode, WebSocketRouteRegistry.RouteHandler handler) throws Exception {
+            if (handler.isBinary()) {
+                throw new IllegalArgumentException("Handler for command " + jsonNode.get("command").asText() + " expects binary data");
+            }
+
+            Object controller = WebSocketRouteRegistry.getControllerInstance(handler.getMethod());
+            injectSession(controller);
+
+            Class<?> paramType = handler.getMethod().getParameterTypes()[0];
+            Object paramValue;
+
+            if (paramType == String.class) {
+                paramValue = jsonNode.toString();
+            } else {
+                JsonNode requestNode = jsonNode.get("message");
+                paramValue = objectMapper.treeToValue(requestNode, paramType);
+            }
+
+            handler.getMethod().invoke(controller, paramValue);
+        }
+
+        private void injectSession(Object controller) {
             try {
                 Method setSession = controller.getClass().getMethod("setSession", WebSocketSession.class);
                 setSession.invoke(controller, session);
@@ -166,25 +345,6 @@ public class TcpChatServer {
                 log.debug("[{}] Controller doesn't require session", clientInfo);
             } catch (Exception e) {
                 log.error("[{}] Error injecting session", clientInfo, e);
-            }
-        }
-
-        private void handleOutgoingMessages(OutputStream out) throws IOException, InterruptedException {
-            try {
-                while (!clientSocket.isClosed()) {
-                    var message = session.poll(100, java.util.concurrent.TimeUnit.MILLISECONDS);
-                    if (message == null) {
-                        if (clientSocket.isInputShutdown() || Thread.currentThread().isInterrupted()) {
-                            break;
-                        }
-                        continue;
-                    }
-                    sendWebSocketFrame(out, message.data(), message.isBinary());
-                }
-            } catch (IOException e) {
-                if (!clientSocket.isClosed()) {
-                    throw e;
-                }
             }
         }
 
@@ -231,24 +391,69 @@ public class TcpChatServer {
             }
 
             int secondByte = input.read();
-            int payloadLength = secondByte & 127;
+            boolean masked = (secondByte & 0x80) != 0;
+            int payloadLength = secondByte & 0x7F;
 
             if (payloadLength == 126) {
-                payloadLength = (input.read() << 8) | input.read();
+                payloadLength = (input.read() & 0xFF) << 8 | (input.read() & 0xFF);
             } else if (payloadLength == 127) {
-                throw new IOException("Payload too large");
+                long longLength = ((long) input.read() & 0xFF) << 56
+                        | ((long) input.read() & 0xFF) << 48
+                        | ((long) input.read() & 0xFF) << 40
+                        | ((long) input.read() & 0xFF) << 32
+                        | ((long) input.read() & 0xFF) << 24
+                        | ((long) input.read() & 0xFF) << 16
+                        | ((long) input.read() & 0xFF) << 8
+                        | ((long) input.read() & 0xFF);
+
+                if (longLength > Integer.MAX_VALUE) {
+                    throw new IOException("Payload too large");
+                }
+                payloadLength = (int) longLength;
             }
 
             byte[] mask = new byte[4];
-            input.readNBytes(mask, 0, 4);
-
-            byte[] encoded = input.readNBytes(payloadLength);
-            byte[] decoded = new byte[payloadLength];
-            for (int i = 0; i < payloadLength; i++) {
-                decoded[i] = (byte) (encoded[i] ^ mask[i % 4]);
+            if (masked) {
+                input.readNBytes(mask, 0, 4);
             }
 
-            return decoded;
+            byte[] payload = new byte[payloadLength];
+            int totalRead = 0;
+            while (totalRead < payloadLength) {
+                int chunkSize = Math.min(8192, payloadLength - totalRead);
+                int read = input.read(payload, totalRead, chunkSize);
+                if (read == -1) {
+                    throw new IOException("Unexpected end of stream");
+                }
+                totalRead += read;
+            }
+
+            if (masked) {
+                for (int i = 0; i < payloadLength; i++) {
+                    payload[i] ^= mask[i % 4];
+                }
+            }
+
+            return payload;
+        }
+
+        private void handleOutgoingMessages(OutputStream out) throws IOException, InterruptedException {
+            try {
+                while (!clientSocket.isClosed()) {
+                    var message = session.poll(100, TimeUnit.MILLISECONDS);
+                    if (message == null) {
+                        if (clientSocket.isInputShutdown() || Thread.currentThread().isInterrupted()) {
+                            break;
+                        }
+                        continue;
+                    }
+                    sendWebSocketFrame(out, message.data(), message.isBinary());
+                }
+            } catch (IOException e) {
+                if (!clientSocket.isClosed()) {
+                    throw e;
+                }
+            }
         }
 
         private void sendWebSocketFrame(OutputStream out, byte[] data, boolean isBinary) throws IOException {
@@ -270,11 +475,7 @@ public class TcpChatServer {
             out.flush();
         }
 
-        private String getClientInfo() {
-            return clientSocket.getInetAddress().getHostAddress() + ":" + clientSocket.getPort();
-        }
-
-        private void closeClientConnection(String clientInfo) {
+        private void closeClientConnection() {
             try {
                 if (!clientSocket.isClosed()) {
                     if (!clientSocket.isOutputShutdown()) {
