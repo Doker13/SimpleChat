@@ -11,10 +11,7 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.security.MessageDigest;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 
 @Slf4j
 public class TcpChatServer {
@@ -29,6 +26,8 @@ public class TcpChatServer {
         \r
         """;
 
+    private static final WebSocketSessionManager sessionManager = new WebSocketSessionManager();
+
     public static void main(String[] args) {
         try (ServerSocket serverSocket = new ServerSocket(PORT);
              ExecutorService threadPool = Executors.newVirtualThreadPerTaskExecutor()) {
@@ -38,7 +37,7 @@ public class TcpChatServer {
 
             while (!threadPool.isShutdown()) {
                 Socket clientSocket = serverSocket.accept();
-                threadPool.execute(new WebSocketHandler(clientSocket, threadPool));
+                threadPool.execute(new WebSocketHandler(clientSocket, threadPool, sessionManager));
             }
         } catch (IOException e) {
             log.error("Server error: ", e);
@@ -52,6 +51,7 @@ public class TcpChatServer {
         private String route;
         private final String clientInfo;
         private final WebSocketSession session = new WebSocketSession();
+        private final WebSocketSessionManager sessionManager;
 
         private static class FileUploadState {
             String command;
@@ -74,10 +74,11 @@ public class TcpChatServer {
 
         private final Map<String, FileUploadState> fileUploads = new ConcurrentHashMap<>();
 
-        public WebSocketHandler(Socket socket, ExecutorService threadPool) {
+        public WebSocketHandler(Socket socket, ExecutorService threadPool, WebSocketSessionManager sessionManager) {
             this.clientSocket = socket;
             this.threadPool = threadPool;
             this.clientInfo = clientSocket.getInetAddress().getHostAddress() + ":" + clientSocket.getPort();
+            this.sessionManager = sessionManager;
         }
 
         @Override
@@ -96,6 +97,7 @@ public class TcpChatServer {
             } catch (IOException e) {
                 log.error("[{}] WebSocket error: ", clientInfo, e);
             } finally {
+                sessionManager.unregisterSession(session);
                 closeClientConnection();
             }
         }
@@ -103,6 +105,7 @@ public class TcpChatServer {
         private void handleClientConnection(OutputStream out) throws IOException {
             var inputHandler = threadPool.submit(() -> {
                 try {
+                    sessionManager.setCurrentSession(session);
                     handleClientData();
                 } catch (IOException e) {
                     log.error("[{}] Input handler error: ", clientInfo, e);
@@ -110,6 +113,7 @@ public class TcpChatServer {
             });
 
             try {
+                sessionManager.setCurrentSession(session);
                 handleOutgoingMessages(out);
             } catch (IOException | InterruptedException e) {
                 log.error("[{}] Output handler error: ", clientInfo, e);
@@ -128,7 +132,6 @@ public class TcpChatServer {
                 int opcode = firstByte & 0x0F;
 
                 if (opcode == 0x08) {
-                    closeClientConnection();
                     break;
                 }
 
@@ -280,7 +283,7 @@ public class TcpChatServer {
             uploadState.currentFileId = fileId;
         }
 
-        private void handleBinaryFrame(byte[] binaryData) throws Exception {
+        private void handleBinaryFrame(byte[] binaryData) {
 
             FileUploadState uploadState = fileUploads.values().stream()
                     .filter(state -> state.expectingBinary && state.currentFileId != null)
@@ -299,8 +302,7 @@ public class TcpChatServer {
             }
         }
 
-        private void completeFileUpload(String fileId, FileUploadState uploadState)
-                throws Exception {
+        private void completeFileUpload(String fileId, FileUploadState uploadState) {
             byte[] fileData = new byte[(int) uploadState.totalSize];
             int offset = 0;
             for (byte[] chunk : uploadState.receivedChunks) {
@@ -311,7 +313,14 @@ public class TcpChatServer {
             Object controller = WebSocketRouteRegistry.getControllerInstance(uploadState.handler.getMethod());
             injectSession(controller);
 
-            uploadState.handler.getMethod().invoke(controller, uploadState.metadata, fileData);
+            threadPool.submit(() -> {
+                try {
+                    sessionManager.setCurrentSession(session);
+                    uploadState.handler.getMethod().invoke(controller, uploadState.metadata, fileData);
+                } catch (Exception e) {
+                    log.error("[{}] Controller handler error: ", clientInfo, e);
+                }
+            });
 
             log.info("[{}] File {} uploaded successfully", clientInfo, fileId);
         }
@@ -334,13 +343,20 @@ public class TcpChatServer {
                 paramValue = objectMapper.treeToValue(requestNode, paramType);
             }
 
-            handler.getMethod().invoke(controller, paramValue);
+            threadPool.submit(() -> {
+                try {
+                    sessionManager.setCurrentSession(session);
+                    handler.getMethod().invoke(controller, paramValue);
+                } catch (Exception e) {
+                    log.error("[{}] Controller handler error: ", clientInfo, e);
+                }
+            });
         }
 
         private void injectSession(Object controller) {
             try {
-                Method setSession = controller.getClass().getMethod("setSession", WebSocketSession.class);
-                setSession.invoke(controller, session);
+                Method setSession = controller.getClass().getMethod("setSession", WebSocketSessionManager.class);
+                setSession.invoke(controller, sessionManager);
             } catch (NoSuchMethodException e) {
                 log.debug("[{}] Controller doesn't require session", clientInfo);
             } catch (Exception e) {
@@ -457,23 +473,26 @@ public class TcpChatServer {
         }
 
         private void sendWebSocketFrame(OutputStream out, byte[] data, boolean isBinary) throws IOException {
-            int dataLength = data.length;
+            DataOutputStream dos = new DataOutputStream(out);
+            int opcode = isBinary ? 0x2 : 0x1;
+            dos.writeByte(0x80 | opcode); // FIN + opcode
 
-            out.write(isBinary ? 0x82 : 0x81);
+            int len = data.length;
 
-            if (dataLength <= 125) {
-                out.write(dataLength);
-            } else if (dataLength <= 65535) {
-                out.write(126);
-                out.write((dataLength >> 8) & 0xFF);
-                out.write(dataLength & 0xFF);
+            if (len <= 125) {
+                dos.writeByte(len);
+            } else if (len <= 65535) {
+                dos.writeByte(126);
+                dos.writeShort(len);
             } else {
-                throw new IOException("Payload too large");
+                dos.writeByte(127);
+                dos.writeLong(len);
             }
 
-            out.write(data);
-            out.flush();
+            dos.write(data);
+            dos.flush();
         }
+
 
         private void closeClientConnection() {
             try {

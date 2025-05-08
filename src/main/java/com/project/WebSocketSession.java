@@ -2,6 +2,7 @@ package com.project;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import lombok.extern.slf4j.Slf4j;
 
 import java.util.Arrays;
 import java.util.concurrent.BlockingQueue;
@@ -9,6 +10,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
+@Slf4j
 public class WebSocketSession {
     private static final ObjectMapper objectMapper = new ObjectMapper();
     private static final int CHUNK_SIZE = 64 * 1024;
@@ -17,7 +19,9 @@ public class WebSocketSession {
     private final BlockingQueue<MessageWrapper> lowPriorityQueue = new LinkedBlockingQueue<>();
     private final AtomicInteger fileIdGenerator = new AtomicInteger(0);
 
-    public record MessageWrapper(byte[] data, boolean isBinary, boolean isFileChunk) {}
+    public record MessageWrapper(byte[] data, boolean isBinary, boolean isPartChunk) {}
+
+    public boolean isNextChunk;
 
     public void send(String command, Object message) {
         try {
@@ -71,24 +75,39 @@ public class WebSocketSession {
     }
 
     public MessageWrapper poll(int timeout, TimeUnit unit) throws InterruptedException {
-        MessageWrapper message = highPriorityQueue.poll();
-        if (message != null) {
+        MessageWrapper message;
+        if (isNextChunk && lowPriorityQueue.isEmpty()) {
+            return null;
+        } else if (isNextChunk) {
+            message = lowPriorityQueue.poll(timeout, unit);
+            isNextChunk = false;
             return message;
         }
-
-        message = lowPriorityQueue.poll(timeout, unit);
-
-        if (message != null && message.isFileChunk()) {
-            MessageWrapper nextChunk = lowPriorityQueue.poll();
-            if (nextChunk != null) {
-                return new MessageWrapper(
-                        nextChunk.data(),
-                        nextChunk.isBinary(),
-                        false
-                );
-            }
+        if (highPriorityQueue.isEmpty() && lowPriorityQueue.isEmpty()) {
+            return null;
         }
+        if (lowPriorityQueue.isEmpty()) {
+            message = highPriorityQueue.poll(timeout, unit);
+            return message;
+        } else {
+            message = lowPriorityQueue.poll(timeout, unit);
+            assert message != null;
+            if (message.isPartChunk){
+                isNextChunk = true;
+            }
+            return message;
+        }
+    }
 
-        return message;
+    private void printMessage(MessageWrapper message) {
+        try {
+            if (!message.isBinary) {
+                log.debug(objectMapper.readValue(message.data, ObjectNode.class).toString());
+            } else {
+                log.debug("This is a binary message");
+            }
+        } catch (Exception e) {
+            log.error("Failed to send message", e);
+        }
     }
 }

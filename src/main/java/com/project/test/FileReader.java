@@ -8,17 +8,18 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 
 @Slf4j
-public class FileSaver {
-    public static String saveFileToProjectRoot(String fileName, byte[] data) {
+public class FileReader {
+    public static byte[] readFileFromProjectRoot(String fileName) {
         String projectRoot = System.getProperty("user.dir");
         Path filePath = Paths.get(projectRoot, fileName);
+        byte[] data = null;
 
         try {
-            Files.write(filePath, data);
+            data = Files.readAllBytes(filePath);
         } catch (IOException e) {
             log.error(e.getMessage());
         }
 
-        return filePath.toAbsolutePath().toString();
+        return data;
     }
 }
