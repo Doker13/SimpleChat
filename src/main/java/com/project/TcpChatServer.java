@@ -98,7 +98,6 @@ public class TcpChatServer {
                 log.error("[{}] WebSocket error: ", clientInfo, e);
             } finally {
                 sessionManager.unregisterSession(session);
-                closeClientConnection();
             }
         }
 
@@ -107,6 +106,7 @@ public class TcpChatServer {
                 try {
                     sessionManager.setCurrentSession(session);
                     handleClientData();
+                    closeClientConnection();
                 } catch (IOException e) {
                     log.error("[{}] Input handler error: ", clientInfo, e);
                 }

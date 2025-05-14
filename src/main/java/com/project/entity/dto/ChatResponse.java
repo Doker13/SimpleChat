@@ -10,10 +10,7 @@ import java.util.UUID;
 @Data
 @NoArgsConstructor
 @AllArgsConstructor
-public class AuthResponse {
+public class ChatResponse {
     private UUID id;
-    private String password;
-    private String displayName;
-    private String email;
-    private List<ChatsDTO> chats;
+    List<MessageDTO> messages;
 }

@@ -4,16 +4,15 @@ import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
-import java.util.List;
-import java.util.UUID;
+import java.time.LocalDate;
 
 @Data
 @NoArgsConstructor
 @AllArgsConstructor
-public class AuthResponse {
-    private UUID id;
+public class SignUpRequest {
+    private String username;
     private String password;
     private String displayName;
     private String email;
-    private List<ChatsDTO> chats;
+    private LocalDate birthday;
 }
