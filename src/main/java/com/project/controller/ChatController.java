@@ -76,8 +76,8 @@ public class ChatController {
     @Command("message")
     public void handleMessage(MessageRequest message) {
         try {
-            List<UUID> userIds = messageService.saveMessage(message);
-            session.otherSessions(userIds).send("message", message);
+            NewMessageDTO messageData = messageService.saveMessage(message);
+            session.otherSessions(messageData.getUserIds()).send("message", messageData.getResponse());
         } catch (Exception e) {
             ErrorMessage errorMessage = new ErrorMessage(e.getMessage());
             session.currentSession().send("message", errorMessage);

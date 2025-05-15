@@ -1,15 +1,16 @@
 package com.project.service;
 
+import com.project.model.dto.MessageDTO;
 import com.project.model.dto.MessageRequest;
+import com.project.model.dto.MessageResponse;
+import com.project.model.dto.NewMessageDTO;
 import com.project.repository.ChatMembersRepository;
 import com.project.repository.FileRepository;
 import com.project.repository.MessageRepository;
-import lombok.extern.slf4j.Slf4j;
 
 import java.util.List;
 import java.util.UUID;
 
-@Slf4j
 public class MessageService {
 
     private final MessageRepository messageRepository;
@@ -25,7 +26,7 @@ public class MessageService {
         this.fileRepository = fileRepository;
     }
 
-    public List<UUID> saveMessage(MessageRequest request) throws Exception {
+    public NewMessageDTO saveMessage(MessageRequest request) throws Exception {
         if (request.getContent() == null && request.getFileId() == null) {
             throw new IllegalArgumentException("Either content or fileId must be provided");
         }
@@ -39,6 +40,17 @@ public class MessageService {
             }
         }
 
-        return chatMembersRepository.getChatMemberIds(request.getChatId(), request.getUserId());
+        MessageDTO messageDTO = messageRepository.fetchMessageDTOById(messageId);
+        MessageResponse response = new MessageResponse();
+        response.setChatId(request.getChatId());
+        response.setMessage(messageDTO);
+
+        List<UUID> userIds = chatMembersRepository.getChatMemberIds(request.getChatId(), request.getUserId());
+
+        NewMessageDTO newMessageDTO = new NewMessageDTO();
+        newMessageDTO.setResponse(response);
+        newMessageDTO.setUserIds(userIds);
+
+        return newMessageDTO;
     }
 }
