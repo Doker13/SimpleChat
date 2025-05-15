@@ -1,13 +1,15 @@
-package com.project.entity.dto;
+package com.project.model.dto;
 
 import lombok.AllArgsConstructor;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
+import java.util.UUID;
+
 @Data
 @NoArgsConstructor
 @AllArgsConstructor
-public class AuthRequest {
-    private String username;
-    private String password;
+public class ChatsDTO {
+    private UUID id;
+    private String name;
 }

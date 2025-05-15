@@ -1,8 +1,8 @@
 package com.project.service;
 
-import com.project.entity.dto.AuthRequest;
-import com.project.entity.dto.AuthResponse;
-import com.project.entity.dto.SignUpRequest;
+import com.project.model.dto.AuthRequest;
+import com.project.model.dto.AuthResponse;
+import com.project.model.dto.SignUpRequest;
 import com.project.repository.UserRepository;
 
 public class AuthService {
@@ -24,6 +24,7 @@ public class AuthService {
         }
 
         response.setPassword(null);
+        response.setUserName(request.getUsername());
         return response;
     }
 
@@ -43,6 +44,7 @@ public class AuthService {
         }
 
         response.setPassword(null);
+        response.setUserName(request.getUsername());
         return response;
     }
 

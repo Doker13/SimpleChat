@@ -1,4 +1,4 @@
-package com.project.entity.dto;
+package com.project.model.dto;
 
 import lombok.AllArgsConstructor;
 import lombok.Data;
@@ -13,6 +13,7 @@ import java.util.UUID;
 public class AuthResponse {
     private UUID id;
     private String password;
+    private String userName;
     private String displayName;
     private String email;
     private List<ChatsDTO> chats;

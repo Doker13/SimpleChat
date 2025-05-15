@@ -1,4 +1,4 @@
-package com.project.entity.dto;
+package com.project.model.dto;
 
 import lombok.AllArgsConstructor;
 import lombok.Data;
@@ -7,6 +7,7 @@ import lombok.NoArgsConstructor;
 @Data
 @NoArgsConstructor
 @AllArgsConstructor
-public class ErrorMessage {
-    private String error;
+public class AuthRequest {
+    private String username;
+    private String password;
 }

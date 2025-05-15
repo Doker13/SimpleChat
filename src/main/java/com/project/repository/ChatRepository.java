@@ -1,12 +1,10 @@
 package com.project.repository;
 
 import com.project.DatabaseManager;
-import com.project.entity.dto.ChatResponse;
-import com.project.entity.dto.FileDTO;
-import com.project.entity.dto.MessageDTO;
-import com.project.jooq.tables.Files;
-import com.project.jooq.tables.Messages;
-import com.project.jooq.tables.Users;
+import com.project.jooq.tables.*;
+import com.project.model.dto.ChatResponse;
+import com.project.model.dto.FileDTO;
+import com.project.model.dto.MessageDTO;
 import org.jooq.DSLContext;
 
 import java.math.BigInteger;
@@ -22,6 +20,7 @@ public class ChatRepository {
         Files f = Files.FILES;
 
         List<MessageDTO> messages = dsl.select(
+                        u.ID,
                         m.CONTENT,
                         m.SENT_AT,
                         u.USERNAME,
@@ -44,6 +43,7 @@ public class ChatRepository {
 
                     if (record.get(f.FILE_NAME) != null) {
                         FileDTO fileDTO = new FileDTO();
+                        fileDTO.setFileId(record.get(f.ID));
                         fileDTO.setFileName(record.get(f.FILE_NAME));
                         fileDTO.setExtension(record.get(f.EXTENSION));
                         fileDTO.setSize(BigInteger.valueOf(record.get(f.FILE_SIZE)));
@@ -58,5 +58,29 @@ public class ChatRepository {
         response.setMessages(messages);
 
         return response;
+    }
+
+    public UUID createChat(String chatName, UUID admId, List<UUID> userIds) {
+        DSLContext dsl = DatabaseManager.dsl();
+        Chats c = Chats.CHATS;
+        ChatMembers cm = ChatMembers.CHAT_MEMBERS;
+        boolean isGroup = userIds.size() > 2;
+
+        UUID chatId = dsl.insertInto(c)
+                .set(c.NAME, chatName)
+                .set(c.IS_GROUP, isGroup)
+                .set(c.CREATED_BY, admId)
+                .returning(c.ID)
+                .fetchOne()
+                .getId();
+
+        userIds.forEach(userId -> {
+            dsl.insertInto(cm)
+                    .set(cm.CHAT_ID, chatId)
+                    .set(cm.USER_ID, userId)
+                    .execute();
+        });
+
+        return chatId;
     }
 }
