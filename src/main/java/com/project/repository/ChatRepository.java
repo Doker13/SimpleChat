@@ -7,7 +7,6 @@ import com.project.model.dto.FileDTO;
 import com.project.model.dto.MessageDTO;
 import org.jooq.DSLContext;
 
-import java.math.BigInteger;
 import java.util.List;
 import java.util.UUID;
 
@@ -25,6 +24,7 @@ public class ChatRepository {
                         m.SENT_AT,
                         u.USERNAME,
                         u.DISPLAY_NAME,
+                        f.ID,
                         f.FILE_NAME,
                         f.EXTENSION,
                         f.FILE_SIZE
@@ -40,13 +40,14 @@ public class ChatRepository {
                     dto.setTime(record.get(m.SENT_AT));
                     dto.setUserName(record.get(u.USERNAME));
                     dto.setDisplayName(record.get(u.DISPLAY_NAME));
+                    dto.setUserId(record.get(u.ID));
 
                     if (record.get(f.FILE_NAME) != null) {
                         FileDTO fileDTO = new FileDTO();
                         fileDTO.setFileId(record.get(f.ID));
                         fileDTO.setFileName(record.get(f.FILE_NAME));
                         fileDTO.setExtension(record.get(f.EXTENSION));
-                        fileDTO.setSize(BigInteger.valueOf(record.get(f.FILE_SIZE)));
+                        fileDTO.setSize(record.get(f.FILE_SIZE));
                         dto.setFile(fileDTO);
                     }
 

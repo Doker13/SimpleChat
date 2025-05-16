@@ -66,10 +66,12 @@ public class ChatController {
     public void handleChat(UUID chatId) {
         try {
             ChatResponse response = chatService.getChatMessages(chatId);
+            log.debug(String.valueOf(response));
             session.currentSession().send("chat", response);
         } catch (Exception e) {
             ErrorMessage errorMessage = new ErrorMessage(e.getMessage());
             session.currentSession().send("chat", errorMessage);
+            e.printStackTrace();
         }
     }
 
@@ -77,6 +79,9 @@ public class ChatController {
     public void handleMessage(MessageRequest message) {
         try {
             NewMessageDTO messageData = messageService.saveMessage(message);
+            log.debug(String.valueOf(message));
+            log.debug(String.valueOf(messageData));
+            session.currentSession().send("message", messageData.getResponse());
             session.otherSessions(messageData.getUserIds()).send("message", messageData.getResponse());
         } catch (Exception e) {
             ErrorMessage errorMessage = new ErrorMessage(e.getMessage());
@@ -100,6 +105,7 @@ public class ChatController {
     public void handleGetFile(UUID fileId) {
         try {
             byte[] fileData = fileService.getFileData(fileId);
+            log.debug(String.valueOf(fileId));
             session.currentSession().sendFile("get_file", fileData, fileId);
         } catch (Exception e) {
             ErrorMessage errorMessage = new ErrorMessage(e.getMessage());

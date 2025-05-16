@@ -56,7 +56,7 @@ public class MessageRepository {
                         fileDTO.setFileId(record.get("file_id", UUID.class));
                         fileDTO.setFileName(record.get("file_name", String.class));
                         fileDTO.setExtension(record.get("extension", String.class));
-                        fileDTO.setSize(record.get("file_size", BigInteger.class));
+                        fileDTO.setSize(record.get("file_size", Long.class));
                     }
 
                     MessageDTO dto = new MessageDTO();

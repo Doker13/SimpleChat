@@ -1,7 +1,9 @@
 package com.project;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import lombok.extern.slf4j.Slf4j;
 
 import java.util.Arrays;
@@ -13,6 +15,10 @@ import java.util.concurrent.atomic.AtomicInteger;
 @Slf4j
 public class WebSocketSession {
     private static final ObjectMapper objectMapper = new ObjectMapper();
+    static {
+        objectMapper.registerModule(new JavaTimeModule());
+        objectMapper.disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS);
+    }
     private static final int CHUNK_SIZE = 64 * 1024;
 
     private final BlockingQueue<MessageWrapper> highPriorityQueue = new LinkedBlockingQueue<>();
@@ -50,6 +56,7 @@ public class WebSocketSession {
             metaData.put("totalChunks", totalChunks);
             metaData.set("message", objectMapper.valueToTree(metadata));
 
+            log.debug(String.valueOf(metaData));
             lowPriorityQueue.put(new MessageWrapper(
                     objectMapper.writeValueAsBytes(metaData), false, false));
 
@@ -68,6 +75,7 @@ public class WebSocketSession {
                 lowPriorityQueue.put(new MessageWrapper(
                         objectMapper.writeValueAsBytes(preChunk), false, true));
                 lowPriorityQueue.put(new MessageWrapper(chunk, true, true));
+                log.debug(String.valueOf(preChunk));
             }
         } catch (Exception e) {
             throw new RuntimeException("Failed to send file", e);
@@ -81,6 +89,7 @@ public class WebSocketSession {
         } else if (isNextChunk) {
             message = lowPriorityQueue.poll(timeout, unit);
             isNextChunk = false;
+            printMessage(message);
             return message;
         }
         if (highPriorityQueue.isEmpty() && lowPriorityQueue.isEmpty()) {
@@ -88,6 +97,7 @@ public class WebSocketSession {
         }
         if (lowPriorityQueue.isEmpty()) {
             message = highPriorityQueue.poll(timeout, unit);
+            printMessage(message);
             return message;
         } else {
             message = lowPriorityQueue.poll(timeout, unit);
@@ -95,6 +105,7 @@ public class WebSocketSession {
             if (message.isPartChunk){
                 isNextChunk = true;
             }
+            printMessage(message);
             return message;
         }
     }
